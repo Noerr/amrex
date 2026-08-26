@@ -971,14 +971,29 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
     Vector<int> istuff(std::size_t(cnt)*iChunkSize);
     readIntData(istuff.dataPtr(), istuff.size(), ifs, FPC::NativeIntDescriptor());
 
-    // Then the real data in binary.
+    // Then the real data in binary.  Instead of reading this grid's entire real
+    // block into one full-box buffer (which would coexist with the reassembled
+    // host_* buffers below, holding two full-box host copies at once), stream it
+    // in bounded sequential segments.  istuff already holds the whole int block,
+    // and this grid's real block is contiguous in the file, so reading it in
+    // chunks of at most chunk_np particles caps the host transient at ~1x the
+    // box instead of ~2x -- matching the checkpoint write footprint and letting
+    // large-particle checkpoints restart within host DRAM.
     const int rChunkSize = ParticleType::is_soa_particle ? NStructReal + NumRealComps() : AMREX_SPACEDIM + NStructReal + NumRealComps();
-    Vector<RTYPE> rstuff(std::size_t(cnt)*rChunkSize);
-    ReadParticleRealData(rstuff.dataPtr(), rstuff.size(), ifs);
 
-    // Now reassemble the particles.
+    // Target ~256 MiB of real data per read segment; clamp to [1, cnt].
+    constexpr std::size_t target_seg_bytes = std::size_t(256) << 20;
+    const std::size_t seg_bytes_per_part = std::max(std::size_t(1),
+        std::size_t(rChunkSize) * sizeof(RTYPE));
+    const std::size_t chunk_np = std::max(std::size_t(1),
+        std::min(std::size_t(cnt), target_seg_bytes / seg_bytes_per_part));
+
+    // Now reassemble the particles.  iptr walks the resident int block; rptr is
+    // (re)pointed at each freshly read real-data segment inside the loop below.
+    Vector<RTYPE> rstuff;
     int*   iptr = istuff.dataPtr();
-    RTYPE* rptr = rstuff.dataPtr();
+    RTYPE* rptr = nullptr;
+    std::size_t seg_end = 0;
 
     Particle<NStructReal, NStructInt> ptemp;
     ParticleLocData pld;
@@ -1002,6 +1017,17 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
     host_idcpu.resize(finest_level_in_file+1);
 
     for (int i = 0; i < cnt; i++) {
+        // Load the next contiguous real-data segment when the current one is
+        // exhausted.  rptr is reset to the new segment; iptr is not (the whole
+        // int block is already resident and walked continuously).
+        if (std::size_t(i) >= seg_end) {
+            const std::size_t seg_np = std::min(chunk_np, std::size_t(cnt - i));
+            rstuff.resize(seg_np * std::size_t(rChunkSize));
+            ReadParticleRealData(rstuff.dataPtr(), rstuff.size(), ifs);
+            rptr = rstuff.dataPtr();
+            seg_end += seg_np;
+        }
+
         // note: for pure SoA particle layouts, we do write the id, cpu and positions as a struct
         //       for backwards compatibility with readers
         if (convert_ids) {
