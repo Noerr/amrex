@@ -603,6 +603,26 @@ void packBuffer (const PC& pc, const ParticleCopyOp& op, const ParticleCopyPlan&
         total_buffer_size = plan.m_snd_offsets.back();
     }
 
+    // TEMPORARY DIAGNOSTIC -- see AMREX_RESTART_DEBUG. Reports the send buffer
+    // actually allocated. A size of 0 on the restart redistribute is the
+    // observable form of "no send buffer was allocated". Limited to the first
+    // few calls per rank so that the per-step redistribute during evolve does
+    // not flood the log.
+    {
+        static const bool dbg = (std::getenv("AMREX_RESTART_DEBUG") != nullptr);
+        static int ncalls = 0;
+        if (dbg && ncalls < 6) {
+            ++ncalls;
+            amrex::AllPrint()
+                << "[restart-dbg] packBuffer rank=" << ParallelDescriptor::MyProc()
+                << " call=" << ncalls
+                << " snd_buffer_bytes=" << total_buffer_size
+                << " (" << (total_buffer_size/(1024*1024)) << " MiB)"
+                << " arena=" << (snd_buffer.arena()->isDevice() ? "device" : "other")
+                << "\n";
+        }
+    }
+
     if (! snd_buffer.arena()->hasFreeDeviceMemory(total_buffer_size)) {
         snd_buffer.clear();
         snd_buffer.setArena(The_Pinned_Arena());
@@ -945,6 +965,23 @@ void communicateParticlesStart (const PC& pc, ParticleCopyPlan& plan, const SndB
     plan.m_rcv_pad_correction_d.resize(plan.m_rcv_pad_correction_h.size());
     Gpu::copy(Gpu::hostToDevice, plan.m_rcv_pad_correction_h.begin(), plan.m_rcv_pad_correction_h.end(),
               plan.m_rcv_pad_correction_d.begin());
+
+    // TEMPORARY DIAGNOSTIC -- see AMREX_RESTART_DEBUG. Companion to the
+    // packBuffer line: reports the receive buffer actually allocated.
+    {
+        static const bool dbg = (std::getenv("AMREX_RESTART_DEBUG") != nullptr);
+        static int ncalls = 0;
+        if (dbg && ncalls < 6) {
+            ++ncalls;
+            amrex::AllPrint()
+                << "[restart-dbg] rcvBuffer rank=" << ParallelDescriptor::MyProc()
+                << " call=" << ncalls
+                << " rcv_buffer_bytes=" << TotRcvBytes
+                << " (" << (TotRcvBytes/(1024*1024)) << " MiB)"
+                << " nrcvs=" << RcvProc.size()
+                << "\n";
+        }
+    }
 
     rcv_buffer.resize(TotRcvBytes);
 

@@ -1,6 +1,8 @@
 #include <AMReX_ParticleCommunication.H>
 #include <AMReX_ParticleContainerBase.H>
 #include <AMReX_ParallelDescriptor.H>
+#include <AMReX_Print.H>
+#include <cstdlib>
 
 #include <iterator>
 
@@ -122,6 +124,28 @@ void ParticleCopyPlan::buildMPIStart (const ParticleContainerBase& pc, const Par
         {
             tot_snds_this_proc += m_Snds[i];
             tot_rcvs_this_proc += m_Rcvs[i];
+        }
+    }
+
+    // TEMPORARY DIAGNOSTIC -- see AMREX_RESTART_DEBUG. This is the early-out
+    // that a matched-box-array restart is expected to take: nothing to send,
+    // nothing to receive, and the function returns before any send or receive
+    // buffer is sized. Reporting both branches so the log distinguishes
+    // "took the early-out" from "did not reach it".
+    {
+        static const bool dbg = (std::getenv("AMREX_RESTART_DEBUG") != nullptr);
+        static int ncalls = 0;
+        if (dbg && ncalls < 6) {
+            ++ncalls;
+            amrex::AllPrint()
+                << "[restart-dbg] copyPlan rank=" << ParallelDescriptor::MyProc()
+                << " call=" << ncalls
+                << " tot_snds=" << tot_snds_this_proc
+                << " tot_rcvs=" << tot_rcvs_this_proc
+                << ((tot_snds_this_proc == 0 && tot_rcvs_this_proc == 0)
+                        ? " -> EARLY-OUT, no buffers allocated"
+                        : " -> proceeding, buffers will be allocated")
+                << "\n";
         }
     }
 

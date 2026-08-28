@@ -735,13 +735,47 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
             // a placeholder so that MFIter below works uniformly.
             file_bas[lev] = BoxArray(Geom(lev).Domain());
         }
-        const int NReaders = MaxReaders();
-        if (ParallelDescriptor::NProcs() <= NReaders) {
-            file_dms[lev] = DistributionMapping(file_bas[lev]);
+        // If the checkpoint's box array is the one this container is already
+        // using, read each box on the rank that owns it. Particles then land
+        // directly in their final tile, and the Redistribute() at the end of
+        // Restart() has nothing to move: it takes the
+        // tot_snds == 0 && tot_rcvs == 0 early-out and allocates no send or
+        // receive buffer at all.
+        //
+        // This is the pre-#5497 behaviour for the common case, restored here
+        // because the memory cost of not doing it is severe at scale. Reading
+        // a box that belongs to another rank means holding, concurrently: the
+        // foreign box's tile, a send buffer sized to essentially all of it, a
+        // receive buffer for this rank's own box arriving from elsewhere, and
+        // the destination tile -- several times the steady-state particle
+        // payload. That caps how much device memory a run can use in steady
+        // state and still be restartable, which directly limits strong
+        // scaling.
+        //
+        // #5497's purpose -- not requiring the caller's grids to match the
+        // file's -- is unaffected: when the box arrays genuinely differ, the
+        // original path below is taken unchanged.
+        const bool ba_matches =
+            (lev <= finestLevel()) && (file_bas[lev] == ParticleBoxArray(lev));
+        if (std::getenv("AMREX_RESTART_DEBUG") != nullptr) {
+            amrex::Print()
+                << "[restart-dbg] lev=" << lev
+                << " boxarray_matches=" << (ba_matches ? "yes" : "no")
+                << " -> read_dm=" << (ba_matches ? "container (no shuffle)"
+                                                 : "file-derived (redistribute)")
+                << "\n";
+        }
+        if (ba_matches) {
+            file_dms[lev] = ParticleDistributionMap(lev);
         } else {
-            Vector<int> pmap(file_bas[lev].size());
-            for (int i = 0; i < (int)pmap.size(); ++i) { pmap[i] = i % NReaders; }
-            file_dms[lev] = DistributionMapping(pmap);
+            const int NReaders = MaxReaders();
+            if (ParallelDescriptor::NProcs() <= NReaders) {
+                file_dms[lev] = DistributionMapping(file_bas[lev]);
+            } else {
+                Vector<int> pmap(file_bas[lev].size());
+                for (int i = 0; i < (int)pmap.size(); ++i) { pmap[i] = i % NReaders; }
+                file_dms[lev] = DistributionMapping(pmap);
+            }
         }
     }
 
