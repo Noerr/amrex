@@ -6,6 +6,9 @@
 #include <AMReX_WriteBinaryParticleData.H>
 #include <AMReX_VisMF.H>
 
+#include <AMReX_Print.H>
+
+#include <cstdlib>
 #include <iterator>
 
 namespace amrex {
@@ -760,6 +763,69 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
             grids_to_read.push_back(mfi.index());
         }
 
+        // TEMPORARY DIAGNOSTIC / EXPERIMENT SCAFFOLDING -- not for upstream.
+        //
+        //   AMREX_RESTART_DEBUG=1    log the read layout and every dst_tile
+        //                            resize, to establish how many boxes this
+        //                            rank reads, how big they are, and whether
+        //                            any destination tile is grown more than
+        //                            once (which would mean realloc churn).
+        //   AMREX_RESTART_PRESIZE=1  reserve each destination tile to its known
+        //                            final size before reading, so that the
+        //                            resize inside ReadParticles cannot
+        //                            reallocate. A no-op if each tile is only
+        //                            ever sized once.
+        //
+        static const bool restart_dbg =
+            (std::getenv("AMREX_RESTART_DEBUG") != nullptr);
+        static const bool restart_presize =
+            (std::getenv("AMREX_RESTART_PRESIZE") != nullptr);
+
+        if (restart_dbg) {
+            Long total_here = 0;
+            Long max_here = 0;
+            for (int grid : grids_to_read) {
+                total_here += grid_table[grid].count;
+                max_here = std::max(max_here, Long(grid_table[grid].count));
+            }
+            amrex::AllPrint()
+                << "[restart-dbg] rank=" << ParallelDescriptor::MyProc()
+                << " lev=" << lev
+                << " boxes_in_file=" << grid_table.size()
+                << " boxes_this_rank=" << grids_to_read.size()
+                << " particles_this_rank=" << total_here
+                << " largest_box=" << max_here
+                << "\n";
+            for (int grid : grids_to_read) {
+                amrex::AllPrint()
+                    << "[restart-dbg]   rank=" << ParallelDescriptor::MyProc()
+                    << " lev=" << lev << " grid=" << grid
+                    << " count=" << grid_table[grid].count
+                    << " file=" << grid_table[grid].which
+                    << "\n";
+            }
+        }
+
+        if (restart_presize) {
+            // Destination tile for a given file box is keyed by that box's
+            // grid index, so the final size is known from the header before
+            // any particle is read.
+            for (int grid : grids_to_read) {
+                if (grid_table[grid].count <= 0) { continue; }
+                auto& dst_tile = DefineAndReturnParticleTile(lev, grid, 0);
+                const auto want = dst_tile.size() + std::size_t(grid_table[grid].count);
+                if (restart_dbg) {
+                    amrex::AllPrint()
+                        << "[restart-presize] rank=" << ParallelDescriptor::MyProc()
+                        << " lev=" << lev << " grid=" << grid
+                        << " reserve=" << want << "\n";
+                }
+                // Exact, not the default Poisson: the whole point is to
+                // allocate the known final size once, with no headroom.
+                dst_tile.reserve(want, GrowthStrategy::Exact);
+            }
+        }
+
         for(int grid : grids_to_read) {
             if (grid_table[grid].count <= 0) { continue; }
 
@@ -1005,6 +1071,30 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
                 amrex::ignore_unused(src_tile);
                 new_size += host_real_attribs[host_lev][std::make_pair(grid,tile)][0].size();
             }
+            // TEMPORARY DIAGNOSTIC -- not for upstream. See AMREX_RESTART_DEBUG
+            // above. old==0 on every line means each destination tile is sized
+            // exactly once and there is no realloc churn to remove; old>0 means
+            // the tile is being grown and AMREX_RESTART_PRESIZE should help.
+            {
+                static const bool restart_dbg_r =
+                    (std::getenv("AMREX_RESTART_DEBUG") != nullptr);
+                if (restart_dbg_r) {
+                    const std::size_t psize_bytes =
+                        sizeof(uint64_t)
+                        + std::size_t(NumRealComps())*sizeof(ParticleReal)
+                        + std::size_t(NumIntComps())*sizeof(int);
+                    amrex::AllPrint()
+                        << "[restart-dbg] resize rank=" << ParallelDescriptor::MyProc()
+                        << " lev=" << host_lev
+                        << " grid=" << grid << " tile=" << tile
+                        << " old=" << old_size << " new=" << new_size
+                        << " cap=" << dst_tile.capacity()
+                        << " delta_MiB="
+                        << ((new_size - old_size)*psize_bytes)/(1024*1024)
+                        << "\n";
+                }
+            }
+
             dst_tile.resize(new_size);
 
             if constexpr(!ParticleType::is_soa_particle)
