@@ -3,6 +3,9 @@
 #include <AMReX_BLProfiler.H>
 #include <AMReX_ParallelDescriptor.H>
 #include <AMReX_Print.H>
+
+#include <atomic>
+#include <ctime>
 #include <AMReX_Vector.H>
 #include <AMReX_ParmParse.H>
 #include <AMReX_Utility.H>
@@ -84,13 +87,17 @@ void Finalize ()
         // The profiler entry for this region gives the same duration, but only
         // if the run reaches the end and prints its report; these lines survive
         // a job that is killed mid-drain, which is exactly the case of interest.
-        amrex::Print() << "AsyncOut::Finalize(): waiting for asynchronous output to drain\n";
+        // Qualified by rank for the same reason as the per-job line above: this
+        // is the reporting rank's own writer thread draining, not a statement
+        // about every rank.
+        amrex::Print() << "AsyncOut::Finalize(): rank " << ParallelDescriptor::MyProc()
+                       << " waiting for asynchronous output to drain\n";
         const double t_start = amrex::second();
 
         s_thread.reset();
 
-        amrex::Print() << "AsyncOut::Finalize(): asynchronous output drained in "
-                       << amrex::second() - t_start << " s\n";
+        amrex::Print() << "AsyncOut::Finalize(): rank " << ParallelDescriptor::MyProc()
+                       << " drained in " << amrex::second() - t_start << " s\n";
     }
 
 #ifdef AMREX_USE_MPI
@@ -124,14 +131,72 @@ WriteInfo GetWriteInfo (int rank)
     return WriteInfo{.ifile = ifile, .ispot = ispot, .nspots = nspots};
 }
 
+namespace {
+
+std::atomic<int> s_job_seq{0};
+
+// Wrap a submitted job so that its completion is reported from the background
+// thread, at the moment it finishes, without the main thread waiting for
+// anything. Asynchronous writes can run for many minutes while the simulation
+// continues, and until now nothing recorded when one actually finished: the
+// only guaranteed drain is at program exit, which for a run checkpointing every
+// few hours may be a very long time after the fact, or may never happen if the
+// job is killed.
+//
+// The line carries a wall-clock timestamp so it can be correlated with the
+// simulation's own output, and the elapsed write time. Checkpoints separated by
+// hours make the timestamp unambiguous on its own; a label would be needed only
+// if submissions became closely spaced.
+std::function<void()> with_completion_log (std::function<void()> f)
+{
+    const int seq = s_job_seq++;
+    return [f = std::move(f), seq] () {
+        const double t_start = amrex::second();
+
+        f();
+
+        const double dt = amrex::second() - t_start;
+
+        std::time_t const t_now = std::time(nullptr);
+        std::tm tm_buf{};
+        char stamp[32] = "unknown";
+#if defined(_WIN32)
+        if (localtime_s(&tm_buf, &t_now) == 0) {
+            std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm_buf);
+        }
+#else
+        // localtime_r rather than localtime: this runs on the background
+        // thread, and localtime returns a pointer to shared static storage.
+        if (localtime_r(&t_now, &tm_buf) != nullptr) {
+            std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm_buf);
+        }
+#endif
+
+        // Built as a single line and written with one insertion, to minimise
+        // interleaving with main-thread output.
+        //
+        // Named as one rank's completion, deliberately. amrex::Print reports
+        // from the I/O process only, so this says nothing about the other
+        // ranks: with fewer files than ranks, the ranks sharing a file write in
+        // turn via the Wait/Notify baton, and the reporting rank is generally
+        // early in its group. Treat it as a lower bound on when the output as a
+        // whole was complete, not as a statement that it was.
+        amrex::Print() << "AsyncOut: rank " << ParallelDescriptor::MyProc()
+                       << " finished job " << seq << " at " << stamp
+                       << " after " << dt << " s\n";
+    };
+}
+
+}
+
 void Submit (std::function<void()>&& a_f)
 {
-    s_thread->Submit(std::move(a_f));
+    s_thread->Submit(with_completion_log(std::move(a_f)));
 }
 
 void Submit (std::function<void()> const& a_f)
 {
-    s_thread->Submit(a_f);
+    s_thread->Submit(with_completion_log(a_f));
 }
 
 void Finish ()
