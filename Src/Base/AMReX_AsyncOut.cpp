@@ -2,6 +2,7 @@
 #include <AMReX_BackgroundThread.H>
 #include <AMReX_BLProfiler.H>
 #include <AMReX_ParallelDescriptor.H>
+#include <AMReX_Print.H>
 #include <AMReX_Vector.H>
 #include <AMReX_ParmParse.H>
 #include <AMReX_Utility.H>
@@ -68,7 +69,28 @@ void Finalize ()
     BL_PROFILE("AsyncOut::Finalize()");
 
     if (s_thread) {
+        // Announce before blocking, and report after. amrex::Print flushes on
+        // both sides of its write, so the first line reaches the log before the
+        // join begins. That matters for two reasons:
+        //
+        //   - a run that appears hung at exit can be identified as waiting on
+        //     output rather than stuck elsewhere, without attaching a debugger;
+        //   - the second line is positive evidence that asynchronous writes
+        //     actually completed. File count, size and mtime do not establish
+        //     that a checkpoint was fully written -- only that the writer got
+        //     far enough to create the entries. This is the "true completion"
+        //     signal that inspecting the output directory cannot provide.
+        //
+        // The profiler entry for this region gives the same duration, but only
+        // if the run reaches the end and prints its report; these lines survive
+        // a job that is killed mid-drain, which is exactly the case of interest.
+        amrex::Print() << "AsyncOut::Finalize(): waiting for asynchronous output to drain\n";
+        const double t_start = amrex::second();
+
         s_thread.reset();
+
+        amrex::Print() << "AsyncOut::Finalize(): asynchronous output drained in "
+                       << amrex::second() - t_start << " s\n";
     }
 
 #ifdef AMREX_USE_MPI
