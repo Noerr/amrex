@@ -840,7 +840,9 @@ amrex::Finalize (amrex::AMReX* pamrex)
     if (init_hypre) { HYPRE_Finalize(); }
 #endif
 
-    BL_TINY_PROFILE_FINALIZE();
+    // NOTE: BL_TINY_PROFILE_FINALIZE() used to be called here, before the
+    // finalize-function stack below. It has been moved to just after that
+    // stack; see the comment there for why.
     BL_PROFILE_FINALIZE();
 
 #ifdef AMREX_USE_GPU
@@ -862,6 +864,33 @@ amrex::Finalize (amrex::AMReX* pamrex)
         //
         The_Finalize_Function_Stack.pop();
     }
+
+    // Finalize the timing half of TinyProfiler here, after the finalize
+    // functions, rather than before them.
+    //
+    // Several registered finalize functions do substantial work. AsyncOut in
+    // particular joins its background writer thread, blocking until every
+    // queued asynchronous write has drained -- time that is part of the run
+    // but fell outside the profiled window when this was called earlier. The
+    // reported total is t_final - t_init, so finalizing here extends it to
+    // include that work, and any BL_PROFILE region inside a finalize function
+    // is now recorded rather than discarded.
+    //
+    // This is safe with respect to ordering: the stack is drained
+    // unconditionally on every rank, so all ranks reach this point, and
+    // TinyProfiler::Finalize's collectives (ParallelReduce / Gather) still
+    // have a live communicator -- ParallelDescriptor::EndParallel() is much
+    // later, and the MemPool block below already performs reductions after
+    // this point.
+    //
+    // It also closes a small race. Finalizing before the stack meant reading
+    // the global stats map on the main thread while AsyncOut's writer thread
+    // was still alive; joining first removes that overlap.
+    //
+    // Note the memory half, BL_TINY_PROFILE_MEMORYFINALIZE(), is already
+    // called after this stack, so the two halves are now finalized on the
+    // same side of it.
+    BL_TINY_PROFILE_FINALIZE();
 
     // The MemPool stuff is not using The_Finalize_Function_Stack so that
     // it can be used in Fortran BoxLib.

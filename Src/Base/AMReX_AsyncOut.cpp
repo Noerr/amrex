@@ -1,5 +1,6 @@
 #include <AMReX_AsyncOut.H>
 #include <AMReX_BackgroundThread.H>
+#include <AMReX_BLProfiler.H>
 #include <AMReX_ParallelDescriptor.H>
 #include <AMReX_Vector.H>
 #include <AMReX_ParmParse.H>
@@ -57,6 +58,15 @@ void Initialize ()
 
 void Finalize ()
 {
+    // Destroying the BackgroundThread submits a sentinel job and then joins,
+    // so this blocks until every queued asynchronous write has completed. That
+    // drain is real wall time at the end of a run and was previously invisible
+    // to the profiler, which finalized before the finalize-function stack ran.
+    // The write itself happens on the background thread and cannot be profiled
+    // here -- TinyProfiler keeps a single region stack and is not thread-aware
+    // -- but the main thread's wait for it is exactly the quantity of interest.
+    BL_PROFILE("AsyncOut::Finalize()");
+
     if (s_thread) {
         s_thread.reset();
     }
